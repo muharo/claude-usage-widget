@@ -2,7 +2,8 @@ import SwiftUI
 
 @main
 struct ClaudeUsageWidgetApp: App {
-    @StateObject private var poller = Poller()
+    @StateObject private var poller    = Poller()
+    @StateObject private var loginItem = LoginItem()
 
     var body: some Scene {
         // Menu bar only — the host app has no main window. The widget itself
@@ -11,6 +12,7 @@ struct ClaudeUsageWidgetApp: App {
         MenuBarExtra("Claude Usage", systemImage: "gauge.with.dots.needle.bottom.50percent") {
             MenuBarView()
                 .environmentObject(poller)
+                .environmentObject(loginItem)
         }
         .menuBarExtraStyle(.window)
         .commands {

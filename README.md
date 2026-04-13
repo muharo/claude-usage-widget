@@ -87,6 +87,17 @@ Click **Always Allow** so the app doesn't ask again.
 The rings will populate within the first poll interval (default 5 minutes). Use the
 **↻** button on the widget or in the menu-bar popover to trigger an immediate refresh.
 
+### 6. (Optional) Start at login
+
+Click the menu-bar gauge icon and tick **Launch at login**. The host app
+uses `SMAppService.mainApp` (macOS 13+), so the toggle registers the app
+itself — no helper bundle, no Login Items entitlement. macOS may ask you
+to approve the login item once in **System Settings → General → Login
+Items**; the menu-bar popover shows a hint when that's required.
+
+To disable it later, untick the same toggle — or remove the entry from
+**System Settings → General → Login Items** directly.
+
 ---
 
 ## Upgrading after a code change
@@ -112,6 +123,44 @@ Then right-click the desktop → **Edit Widgets** → remove and re-add the widg
 
 ---
 
+## Rebuild from scratch
+
+When Xcode, WidgetKit, or the widget extension registration gets into a weird
+state (stale timeline, widget missing from Edit Widgets, duplicate menu-bar
+icons), a full clean rebuild usually fixes it:
+
+```bash
+cd claude-usage-widget
+
+# 1. Throw away the generated project and every build cache.
+rm -rf ClaudeUsageWidget.xcodeproj
+rm -rf "$HOME/Library/Developer/Xcode/DerivedData"/ClaudeUsageWidget-*
+
+# 2. Ask the widget daemon and Dock to forget the old extension.
+killall chronod 2>/dev/null || true
+killall Dock    2>/dev/null || true
+
+# 3. (Optional) confirm pluginkit has forgotten the old extension.
+pluginkit -m -p com.apple.widgetkit-extension | grep -i claudeusage || echo "clean"
+
+# 4. Regenerate the project and rebuild.
+xcodegen generate
+open ClaudeUsageWidget.xcodeproj
+# …then press ⌘R in Xcode.
+```
+
+Once the host app has launched at least once, right-click the desktop →
+**Edit Widgets** → search **Claude Usage** → drag the widget back on.
+
+If you previously saw the "ClaudeUsageWidget would like to access data from
+other apps" prompt, also run once after rebuilding:
+
+```bash
+tccutil reset All com.robert.ClaudeUsageWidget
+```
+
+---
+
 ## What each widget size shows
 
 | Size   | Contents                                                                              |
@@ -134,13 +183,16 @@ Then right-click the desktop → **Edit Widgets** → remove and re-add the widg
 └─────────────┬───────────────┘
               │ writes snapshot.json
               ▼
-   ┌────────────────────────────────────┐
-   │ Widget container                   │
-   │ ~/Library/Containers/              │
-   │   com.robert.ClaudeUsageWidget.    │
-   │   WidgetExtension/Data/…           │
-   └─────────────┬──────────────────────┘
-                 │ reads
+   ┌──────────────────────────────────────────────────┐
+   │ Shared handoff directory                         │
+   │ ~/Library/Containers/                            │
+   │   com.robert.ClaudeUsageWidget.WidgetExtension/  │
+   │   Data/Library/Application Support/              │
+   │     ClaudeUsageWidget/snapshot.json              │
+   │ (widget's own sandbox container —                │
+   │  host writes require a one-time TCC Allow)       │
+   └─────────────┬────────────────────────────────────┘
+                 │ widget reads it as its own Application Support
                  ▼
    ┌──────────────────────────┐    interactive
    │ Widget extension         │ ◄── refresh    ┌──────────┐
@@ -148,6 +200,42 @@ Then right-click the desktop → **Edit Widgets** → remove and re-add the widg
    │ ─ Small/Medium/Large     │    (AppIntent) │ click    │
    └──────────────────────────┘                └──────────┘
 ```
+
+The host↔widget handoff goes through the **widget extension's own sandbox
+container**. This is counter-intuitive (every macOS tutorial tells you to
+use an App Group), but it's the only path that actually works under the
+constraints of this project:
+
+- **App Groups are unavailable.** Free personal Apple teams can't
+  provision `com.apple.security.application-groups`, so
+  `~/Library/Group Containers/…` is off the table.
+- **Temp-exception file entitlements get stripped at sign time.** We
+  tried routing the handoff through `~/.claudeusagewidget/` with
+  `com.apple.security.temporary-exception.files.home-relative-path.read-write`
+  on the widget. The entitlement is present in the source
+  `.entitlements` file, but `codesign -d --entitlements - Widget.appex`
+  shows it's silently dropped during free-team signing. The widget
+  sandbox then denies the read.
+- **`~/Library/Application Support/` is inside `~/Library/`, which the
+  widget sandbox can't reach** without the same kind of temp-exception
+  entitlement that gets stripped.
+- **The widget's own container is freely readable by the widget itself**
+  (it's just its Application Support directory from inside the process).
+  The catch is that on macOS Sonoma 14+, an unsandboxed process writing
+  into another bundle's `~/Library/Containers/…` triggers the
+  **"ClaudeUsageWidget would like to access data from other apps"** TCC
+  dialog. It fires **once**, the user clicks Allow, and macOS remembers
+  the decision keyed on the code signature.
+
+The one-time TCC click is the price of avoiding App Groups. See the
+troubleshooting section below for what to expect on first launch, and set
+a stable `DEVELOPMENT_TEAM` in `project.yml` so the Allow decision
+survives rebuilds. The host also writes a redundant copy into
+`~/.claudeusagewidget/` as a no-TCC safety cache for local debugging —
+the widget can't read it, but `ls` and external tools can.
+
+See `Shared/SharedStore.swift` for the full write-target / read-fallback
+logic.
 
 ### The OAuth call
 
@@ -282,6 +370,51 @@ entry and the widget picks up the new token on the next poll.
 Open **System Settings → Privacy & Security → Keychain Access**, find `Claude Code-credentials`,
 and add `ClaudeUsageWidget` to its access control list. Click **Always Allow** in the prompt.
 
+### "ClaudeUsageWidget would like to access data from other apps"
+
+This is a **different** dialog from the keychain prompt above. It is a TCC
+(Transparency, Consent, and Control) prompt that macOS Sonoma 14+ shows
+whenever an unsandboxed app reads or writes another app's
+`~/Library/Containers/…` directory.
+
+**On this project, the prompt is expected to appear exactly once on first
+launch after install.** Click **Allow**. The host app needs to write the
+snapshot file into the widget extension's sandbox container as its
+handoff path — see the "Architecture" section above for why every other
+option is blocked by free-team signing constraints. macOS remembers your
+Allow decision keyed to the app's code signature, so subsequent launches
+are silent.
+
+If the prompt keeps re-appearing on every launch, your code signature is
+changing between builds. Two fixes, in order:
+
+1. **Set a stable `DEVELOPMENT_TEAM` in `project.yml`.** Find your team
+   ID via Xcode → Settings → Accounts → (your account) → Manage
+   Certificates, or the output of
+   `security find-identity -v -p codesigning`. Add it under
+   `settings.base`:
+   ```yaml
+   settings:
+     base:
+       DEVELOPMENT_TEAM: YOURTEAMID
+   ```
+   Regenerate with `xcodegen generate` and rebuild. All subsequent
+   builds will sign with the same identity and TCC will stop re-asking.
+
+2. **Reset the existing TCC decision once**, in case macOS cached a
+   decision tied to a stale signature:
+   ```bash
+   tccutil reset All com.robert.ClaudeUsageWidget
+   tccutil reset All com.robert.ClaudeUsageWidget.WidgetExtension
+   killall chronod 2>/dev/null; killall Dock
+   ```
+   Relaunch the host app, click **Allow** one more time — that decision
+   will now be keyed to the stable signature from step 1.
+
+If you want a completely prompt-free install you need a paid Apple
+Developer account, which would let you provision an App Group and route
+the handoff through `~/Library/Group Containers/…` instead.
+
 ### "The endpoint changed and now everything is broken"
 
 Anthropic can change the OAuth endpoint or beta header at any time. The fix is usually a
@@ -289,19 +422,60 @@ one-line change in `Shared/UsageService.swift`. Issues and PRs are welcome.
 
 ---
 
-## Uninstall
+## Complete uninstall
+
+The app writes to several locations. Run the block below top-to-bottom to
+remove every artifact including build caches, widget registration, TCC
+decisions, and optionally the source checkout itself.
 
 ```bash
-# 1. Quit the app (click the menu-bar icon → Quit, or kill it)
-#    macOS automatically unregisters the widget extension when the app is gone.
+# 1. Quit the app and make sure nothing is left running.
+pkill -x ClaudeUsageWidget 2>/dev/null || true
 
-# 2. Delete the app (if installed outside Xcode)
+# 2. Unregister the widget extension from macOS.
+#    chronod is the system daemon that hosts desktop widgets.
+pluginkit -r "$HOME/Library/Developer/Xcode/DerivedData"/ClaudeUsageWidget-*/Build/Products/Debug/ClaudeUsageWidget.app/Contents/PlugIns/ClaudeUsageWidgetExtension.appex 2>/dev/null || true
+killall chronod 2>/dev/null || true
+killall Dock    2>/dev/null || true
+
+# 3. Delete the built app (only exists if you copied it out of DerivedData).
 rm -rf /Applications/ClaudeUsageWidget.app
 
-# 3. Delete cached data
-rm -rf "$HOME/Library/Containers/com.robert.ClaudeUsageWidget.WidgetExtension"
+# 4. Delete cached snapshot, token, and container data.
+rm -rf "$HOME/.claudeusagewidget"
 rm -rf "$HOME/Library/Application Support/ClaudeUsageWidget"
+rm -rf "$HOME/Library/Containers/com.robert.ClaudeUsageWidget"
+rm -rf "$HOME/Library/Containers/com.robert.ClaudeUsageWidget.WidgetExtension"
+rm -rf "$HOME/Library/Group Containers/group.com.robert.claude-usage-widget"
+
+# 5. Delete saved preferences (poll interval, window state).
+defaults delete com.robert.ClaudeUsageWidget 2>/dev/null || true
+rm -f "$HOME/Library/Preferences/com.robert.ClaudeUsageWidget.plist"
+rm -f "$HOME/Library/Preferences/com.robert.ClaudeUsageWidget.WidgetExtension.plist"
+
+# 6. Delete Xcode build artifacts.
+rm -rf "$HOME/Library/Developer/Xcode/DerivedData"/ClaudeUsageWidget-*
+
+# 7. Reset any TCC decisions the app accumulated
+#    (needed if you ever saw the "access data from other apps" prompt).
+tccutil reset All com.robert.ClaudeUsageWidget                 2>/dev/null || true
+tccutil reset All com.robert.ClaudeUsageWidget.WidgetExtension 2>/dev/null || true
+
+# 8. Delete the generated Xcode project (xcodegen regenerates it).
+rm -rf ClaudeUsageWidget.xcodeproj
+
+# 9. (Optional) Delete the source checkout itself.
+cd .. && rm -rf claude-usage-widget
 ```
+
+Notes:
+
+- The keychain entry `Claude Code-credentials` belongs to Claude Code, **not**
+  to this widget. Do NOT delete it unless you also want to sign out of
+  Claude Code.
+- Step 2's `pluginkit -r` is best-effort; if DerivedData has already been
+  deleted, `killall chronod` alone is enough for macOS to forget the widget
+  on its next launch.
 
 ---
 

@@ -1,31 +1,40 @@
 import Foundation
 import os
 
-/// Reads/writes the snapshot and cached token to every location that either
-/// the host app or the sandboxed widget extension can reach.
+/// Handoff between the unsandboxed host app and the sandboxed widget
+/// extension, in an environment with **no App Group** (free personal team
+/// signing cannot provision App Groups, and temp-exception file entitlements
+/// are silently stripped from the signed bundle — verified via
+/// `codesign -d --entitlements -`).
 ///
-/// Three write targets (best-effort, all attempted on every write):
+/// With those two options off the table, the only path that actually works
+/// is to have the host write into the widget extension's own sandbox
+/// container at
+/// `~/Library/Containers/<widget-bundle>/Data/Library/Application Support/…`.
+/// From inside the widget that's just its own Application Support directory
+/// (free read/write). From the unsandboxed host it's "another app's
+/// container", which on macOS 14+ triggers the TCC dialog
+/// "ClaudeUsageWidget would like to access data from other apps" **once**.
+/// After the user clicks Allow, macOS remembers the decision keyed on the
+/// app's code signature, so subsequent launches don't re-prompt — as long
+/// as the signature stays stable across rebuilds (set a stable
+/// `DEVELOPMENT_TEAM` in `project.yml`).
 ///
-///  1. `~/Library/Application Support/ClaudeUsageWidget/`          ← host-app primary
-///     Accessed via getpwuid so the real home is used even inside a sandbox.
+/// The host *also* writes to `~/.claudeusagewidget/` as a no-TCC safety
+/// fallback. That path is readable by the host itself and by external
+/// tools (useful for debugging), but the widget sandbox cannot read it
+/// without the stripped entitlement, so it's only a secondary cache.
 ///
-///  2. `~/Library/Group Containers/<group-id>/`                    ← App Group
-///     The host app constructs this path manually (non-sandboxed processes
-///     get nil from containerURL). The widget uses containerURL normally.
-///     Requires the App Group to be provisioned (paid developer account).
-///
-///  3. `~/Library/Containers/<widget-bundle-id>/Data/Library/Application Support/ClaudeUsageWidget/`
-///     The widget extension's *own* container. The non-sandboxed host app can
-///     write there freely. Inside the widget sandbox, Application Support maps
-///     to exactly this path — no App Group provisioning needed.
-///
-/// Read order tries #2 and #3 first (the widget-accessible paths), then #1.
+/// The host never *reads* from `widgetContainerDir` — even a `fileExists`
+/// check from the unsandboxed side would retrigger TCC. It only writes.
+/// The widget reads primarily from `widgetContainerDir` (its own home).
 public final class SharedStore {
 
     // MARK: - Constants
 
     public  static let appGroupIdentifier  = "group.com.robert.claude-usage-widget"
     private static let widgetBundleID      = "com.robert.ClaudeUsageWidget.WidgetExtension"
+    private static let sharedDirName       = ".claudeusagewidget"
     private static let snapshotFile        = "snapshot.json"
     private static let tokenFile           = "token.json"
 
@@ -39,23 +48,36 @@ public final class SharedStore {
 
     // MARK: - Directory resolution
 
-    /// Real `~/Library/Application Support/ClaudeUsageWidget/` (host app).
+    /// Canonical host↔widget handoff directory: `~/.claudeusagewidget/`.
+    /// Resolved via `getpwuid` so the widget sandbox sees the real home path
+    /// instead of its per-extension container.
+    private var sharedDataDir: URL {
+        realHome().appendingPathComponent(Self.sharedDirName, isDirectory: true)
+    }
+
+    /// Legacy path: `~/Library/Application Support/ClaudeUsageWidget/`.
+    /// Kept for READ fallback when upgrading from older builds that wrote
+    /// there. Not written to anymore — the widget sandbox can't read it.
     public var primaryDir: URL {
         realHome().appendingPathComponent("Library/Application Support/ClaudeUsageWidget", isDirectory: true)
     }
 
-    /// App Group container — sandboxed widget uses `containerURL`; host app
-    /// constructs the path by hand since `containerURL` returns nil when unsandboxed.
+    /// App Group container. Only queried from the sandboxed widget — the
+    /// unsandboxed host has no App Group entitlement (and provisioning one
+    /// requires a paid developer account), so from the host side
+    /// `containerURL(forSecurityApplicationGroupIdentifier:)` would either
+    /// return nil or probe into `~/Library/Group Containers/` and trigger
+    /// the "access data from other apps" TCC dialog. We skip the entire
+    /// call on the host to stay silent.
     private var appGroupDir: URL? {
-        if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier) {
-            return url
-        }
-        let candidate = realHome().appendingPathComponent("Library/Group Containers/\(Self.appGroupIdentifier)", isDirectory: true)
-        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        guard isSandboxed else { return nil }
+        return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupIdentifier)
     }
 
-    /// Widget extension's own Application Support, inside its sandbox container.
-    /// The host app (non-sandboxed) can always write here directly.
+    /// Widget extension's own Application Support, inside its sandbox
+    /// container. Only written to from inside the widget process itself.
+    /// The host app never reads or writes here — on macOS Sonoma+, accessing
+    /// another app's `~/Library/Containers/…` triggers the TCC prompt.
     private var widgetContainerDir: URL {
         realHome().appendingPathComponent(
             "Library/Containers/\(Self.widgetBundleID)/Data/Library/Application Support/ClaudeUsageWidget",
@@ -77,23 +99,68 @@ public final class SharedStore {
     }
     private func realHome() -> URL { Self.realHome() }
 
+    /// True when the current process runs inside an App Sandbox container.
+    /// Non-sandboxed processes see `NSHomeDirectory()` resolve to the real
+    /// user home; sandboxed ones see it rewritten to the per-process
+    /// container root.
+    private var isSandboxed: Bool {
+        NSHomeDirectory() != Self.realHome().path
+    }
+
     /// All directories the current process should write to.
+    ///
+    /// **Host (unsandboxed):** writes to `widgetContainerDir` (the widget's
+    /// own sandbox container — the primary handoff path, gated by a one-time
+    /// TCC Allow) AND to `sharedDataDir` (a no-TCC safety cache in the user's
+    /// real home dot-directory, useful for debugging and external tools).
+    ///
+    /// **Widget (sandboxed):** writes to `widgetContainerDir` (its own
+    /// Application Support, free). Also writes to `sharedDataDir` — though
+    /// the temp-exception entitlement that was meant to allow this gets
+    /// stripped during personal-team signing, so these writes silently fail.
+    /// Harmless. `sharedDataDir` ends up populated only by the host.
     private var writeDirs: [URL] {
-        var dirs: [URL] = [primaryDir, widgetContainerDir]
+        var dirs: [URL] = [widgetContainerDir, sharedDataDir]
         if let ag = appGroupDir { dirs.append(ag) }
         return dirs
     }
 
-    /// All candidate file URLs to try when reading, most-widget-accessible first.
+    /// All candidate file URLs to try when reading, most-preferred first.
+    ///
+    /// Conditional on sandbox state. The unsandboxed host MUST NOT probe
+    /// `widgetContainerDir` — even a `fileExists` check retriggers the TCC
+    /// "access data from other apps" prompt. The widget reads from its own
+    /// container first (the path that actually holds data).
     private func candidateURLs(_ fileName: String) -> [URL] {
         var urls: [URL] = []
-        // Sandbox-transparent path (works perfectly inside the widget extension).
-        if let d = sandboxedAppSupportDir { urls.append(d.appendingPathComponent(fileName)) }
-        // App Group (if provisioned).
-        if let d = appGroupDir            { urls.append(d.appendingPathComponent(fileName)) }
-        // Widget container & host-app primary.
-        urls.append(widgetContainerDir.appendingPathComponent(fileName))
-        urls.append(primaryDir.appendingPathComponent(fileName))
+
+        if isSandboxed {
+            // Widget extension: read from its own container first. This is
+            // where the host writes after clearing the one-time TCC prompt,
+            // and where the widget's own RefreshIntent writes.
+            if let d = sandboxedAppSupportDir {
+                urls.append(d.appendingPathComponent(fileName))
+            }
+            urls.append(widgetContainerDir.appendingPathComponent(fileName))
+        }
+
+        // Shared dot-directory. Populated by the host as a no-TCC safety
+        // cache; the widget can't actually read it (temp-exception
+        // entitlement stripped by personal-team signing) but the host
+        // reads it back when running locally.
+        urls.append(sharedDataDir.appendingPathComponent(fileName))
+
+        // App Group — only if provisioned (paid developer account).
+        if let d = appGroupDir {
+            urls.append(d.appendingPathComponent(fileName))
+        }
+
+        // Legacy Application Support read fallback from older builds.
+        // Host-only — the widget sandbox can't read ~/Library/Application Support/.
+        if !isSandboxed {
+            urls.append(primaryDir.appendingPathComponent(fileName))
+        }
+
         return urls
     }
 
@@ -114,21 +181,22 @@ public final class SharedStore {
     }
 
     public func read() -> UsageSnapshot? {
+        log.info("read snapshot: sandboxed=\(self.isSandboxed, privacy: .public)")
         for url in candidateURLs(Self.snapshotFile) {
-            if let snap = decode(from: url) { return snap }
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            log.info("  try \(url.path, privacy: .public) exists=\(exists, privacy: .public)")
+            if !exists { continue }
+            do {
+                let data = try Data(contentsOf: url)
+                let snap = try UsageSnapshot.jsonDecoder.decode(UsageSnapshot.self, from: data)
+                log.info("  ✓ decoded \(url.path, privacy: .public)")
+                return snap
+            } catch {
+                log.error("  ✗ \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
         }
+        log.warning("read snapshot: no candidate produced data")
         return nil
-    }
-
-    private func decode(from url: URL) -> UsageSnapshot? {
-        guard FileManager.default.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url) else { return nil }
-        do {
-            return try UsageSnapshot.jsonDecoder.decode(UsageSnapshot.self, from: data)
-        } catch {
-            log.error("decode \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            return nil
-        }
     }
 
     // MARK: - Token cache
@@ -138,17 +206,34 @@ public final class SharedStore {
         guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
         for dir in writeDirs {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try? data.write(to: dir.appendingPathComponent(Self.tokenFile), options: [.atomic])
+            let url = dir.appendingPathComponent(Self.tokenFile)
+            do {
+                try data.write(to: url, options: [.atomic])
+                log.debug("token → \(url.path, privacy: .public)")
+            } catch {
+                log.error("token write \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
     public func readToken() -> String? {
+        log.info("read token: sandboxed=\(self.isSandboxed, privacy: .public)")
         for url in candidateURLs(Self.tokenFile) {
-            if let data = try? Data(contentsOf: url),
-               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                return dict["access_token"]
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            log.info("  try \(url.path, privacy: .public) exists=\(exists, privacy: .public)")
+            if !exists { continue }
+            do {
+                let data = try Data(contentsOf: url)
+                if let dict = try JSONSerialization.jsonObject(with: data) as? [String: String],
+                   let tok = dict["access_token"] {
+                    log.info("  ✓ token from \(url.path, privacy: .public)")
+                    return tok
+                }
+            } catch {
+                log.error("  ✗ \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
+        log.warning("read token: no candidate produced data")
         return nil
     }
 }

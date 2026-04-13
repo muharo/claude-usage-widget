@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct MenuBarView: View {
-    @EnvironmentObject var poller: Poller
+    @EnvironmentObject var poller:    Poller
+    @EnvironmentObject var loginItem: LoginItem
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -34,6 +35,18 @@ struct MenuBarView: View {
                 .labelsHidden()
                 .frame(width: 100)
                 .font(.caption2)
+            }
+            Toggle(isOn: Binding(
+                get: { loginItem.isEnabled },
+                set: { loginItem.setEnabled($0) }
+            )) {
+                Text("Launch at login").font(.caption2)
+            }
+            .toggleStyle(.checkbox)
+            if loginItem.requiresApproval {
+                Text("Approve in System Settings → General → Login Items")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(14)
@@ -150,7 +163,9 @@ struct MenuBarView: View {
 #if DEBUG
 struct MenuBarView_Previews: PreviewProvider {
     static var previews: some View {
-        MenuBarView().environmentObject(Poller())
+        MenuBarView()
+            .environmentObject(Poller())
+            .environmentObject(LoginItem())
     }
 }
 #endif
