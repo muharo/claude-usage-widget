@@ -11,6 +11,16 @@ A native macOS desktop widget that shows everything from
 
 Reset countdowns animate every second so the widget always feels alive, even between polls.
 
+<p align="center">
+  <strong>Menu-bar popover</strong><br>
+  <img src="docs/MenuApp.png" alt="Menu-bar popover" width="220">
+</p>
+
+<p align="center">
+  <strong>Desktop widgets (small, medium, large)</strong><br>
+  <img src="docs/Widgets.png" alt="Desktop widgets" width="480">
+</p>
+
 > ⚠️ **Unofficial endpoint.** There is no public API for consumer Claude usage. This project
 > calls `https://api.anthropic.com/api/oauth/usage`, the same undocumented endpoint Claude Code
 > uses internally. Anthropic could change or remove it without notice — if that happens the
